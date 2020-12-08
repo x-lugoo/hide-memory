@@ -1,0 +1,306 @@
+From 54c4c7ac27c188847f1da28aa11cff5aa211b5ea Mon Sep 17 00:00:00 2001
+From: Jeff Xie <huan.xie@suse.com>
+Date: Tue, 8 Dec 2020 21:43:32 +0800
+Subject: [PATCH] hidemem: Initialization version
+
+---
+ arch/x86/entry/syscalls/syscall_64.tbl |   1 +
+ include/uapi/linux/magic.h             |   1 +
+ mm/Kconfig                             |   3 +
+ mm/Makefile                            |   1 +
+ mm/gup.c                               |   5 +
+ mm/hidemem.c                           | 215 +++++++++++++++++++++++++
+ 6 files changed, 226 insertions(+)
+ create mode 100644 mm/hidemem.c
+
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 379819244b91..e25f8481f7c3 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -362,6 +362,7 @@
+ 438	common	pidfd_getfd		sys_pidfd_getfd
+ 439	common	faccessat2		sys_faccessat2
+ 440	common	process_madvise		sys_process_madvise
++441	common  memfd_hide		sys_memfd_hide
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/include/uapi/linux/magic.h b/include/uapi/linux/magic.h
+index f3956fc11de6..9a9df243ab48 100644
+--- a/include/uapi/linux/magic.h
++++ b/include/uapi/linux/magic.h
+@@ -97,5 +97,6 @@
+ #define DEVMEM_MAGIC		0x454d444d	/* "DMEM" */
+ #define Z3FOLD_MAGIC		0x33
+ #define PPC_CMM_MAGIC		0xc7571590
++#define HIDEMEM_MAGIC		0x88886666
+ 
+ #endif /* __LINUX_MAGIC_H__ */
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 390165ffbb0f..6c7473f08354 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -859,4 +859,7 @@ config ARCH_HAS_HUGEPD
+ config MAPPING_DIRTY_HELPERS
+         bool
+ 
++config HIDEMEM
++	def_bool y
++
+ endmenu
+diff --git a/mm/Makefile b/mm/Makefile
+index d73aed0fc99c..d81ecaa6551f 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -120,3 +120,4 @@ obj-$(CONFIG_MEMFD_CREATE) += memfd.o
+ obj-$(CONFIG_MAPPING_DIRTY_HELPERS) += mapping_dirty_helpers.o
+ obj-$(CONFIG_PTDUMP_CORE) += ptdump.o
+ obj-$(CONFIG_PAGE_REPORTING) += page_reporting.o
++obj-$(CONFIG_HIDEMEM) += hidemem.o
+diff --git a/mm/gup.c b/mm/gup.c
+index 98eb8e6d2609..5d2eb8781b49 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -911,6 +911,8 @@ static int faultin_page(struct vm_area_struct *vma,
+ 	return 0;
+ }
+ 
++extern bool vma_is_hidemem(struct vm_area_struct *vma);
++
+ static int check_vma_flags(struct vm_area_struct *vma, unsigned long gup_flags)
+ {
+ 	vm_flags_t vm_flags = vma->vm_flags;
+@@ -923,6 +925,9 @@ static int check_vma_flags(struct vm_area_struct *vma, unsigned long gup_flags)
+ 	if (gup_flags & FOLL_ANON && !vma_is_anonymous(vma))
+ 		return -EFAULT;
+ 
++	if (vma_is_hidemem(vma))
++		return -EFAULT;
++
+ 	if (write) {
+ 		if (!(vm_flags & VM_WRITE)) {
+ 			if (!(gup_flags & FOLL_FORCE))
+diff --git a/mm/hidemem.c b/mm/hidemem.c
+new file mode 100644
+index 000000000000..ccd2c8e0dd0a
+--- /dev/null
++++ b/mm/hidemem.c
+@@ -0,0 +1,215 @@
++#include <linux/mm.h>
++#include <linux/fs.h>
++#include <linux/cma.h>
++#include <linux/mount.h>
++#include <linux/memfd.h>
++#include <linux/bitops.h>
++#include <linux/printk.h>
++#include <linux/pagemap.h>
++#include <linux/genalloc.h>
++#include <linux/syscalls.h>
++#include <linux/memblock.h>
++#include <linux/pseudo_fs.h>
++#include <linux/memcontrol.h>
++#include <linux/set_memory.h>
++#include <linux/sched/signal.h>
++
++#include <uapi/linux/magic.h>
++
++#include <asm/tlbflush.h>
++
++#include "internal.h"
++
++#undef pr_fmt
++#define pr_fmt(fmt) "hidemem: " fmt
++
++/*
++ * Define mode and flag masks to allow validation of the system call
++ * parameters.
++ */
++#define HIDEMEM_MODE_MASK	(0x0)
++#define HIDEMEM_FLAGS_MASK	HIDEMEM_MODE_MASK
++
++static struct page *hidemem_alloc_page(gfp_t gfp)
++{
++	return alloc_page(gfp);
++}
++
++static vm_fault_t hidemem_fault(struct vm_fault *vmf)
++{
++	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
++	struct inode *inode = file_inode(vmf->vma->vm_file);
++	pgoff_t offset = vmf->pgoff;
++	vm_fault_t ret = 0;
++	struct page *page;
++	int err;
++
++	if (((loff_t)vmf->pgoff << PAGE_SHIFT) >= i_size_read(inode))
++		return vmf_error(-EINVAL);
++
++	page = find_get_page(mapping, offset);
++	if (!page) {
++		page = hidemem_alloc_page(vmf->gfp_mask);
++		if (!page)
++			return vmf_error(-ENOMEM);
++
++		err = add_to_page_cache(page, mapping, offset, vmf->gfp_mask);
++		if (unlikely(err))
++			goto err_put_page;
++
++		__SetPageUptodate(page);
++
++		ret = VM_FAULT_LOCKED;
++	}
++
++	vmf->page = page;
++	return ret;
++
++err_put_page:
++	put_page(page);
++	return vmf_error(err);
++}
++
++static const struct vm_operations_struct hidemem_vm_ops = {
++	.fault = hidemem_fault,
++};
++
++static int hidemem_release(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static int hidemem_mmap(struct file *file, struct vm_area_struct *vma)
++{
++
++	if ((vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) == 0)
++		return -EINVAL;
++
++	vma->vm_ops = &hidemem_vm_ops;
++	vma->vm_flags |= VM_LOCKED;
++
++	return 0;
++}
++
++bool vma_is_hidemem(struct vm_area_struct *vma)
++{
++	return vma->vm_ops == &hidemem_vm_ops;
++}
++
++static const struct file_operations hidemem_fops = {
++	.release	= hidemem_release,
++	.mmap		= hidemem_mmap,
++};
++
++
++static const struct address_space_operations hidemem_aops = {
++};
++
++bool page_is_hidemem(struct page *page)
++{
++	struct address_space *mapping = page_mapping(page);
++
++	if (!mapping)
++		return false;
++
++	return mapping->a_ops == &hidemem_aops;
++}
++
++static struct vfsmount *hidemem_mnt;
++
++static struct file *hidemem_file_create(unsigned long flags)
++{
++	struct file *file = ERR_PTR(-ENOMEM);
++	struct inode *inode;
++
++	inode = alloc_anon_inode(hidemem_mnt->mnt_sb);
++	if (IS_ERR(inode))
++		return ERR_CAST(inode);
++
++	file = alloc_file_pseudo(inode, hidemem_mnt, "hidemem",
++				 O_RDWR, &hidemem_fops);
++	if (IS_ERR(file))
++		goto err_free_inode;
++
++	mapping_set_unevictable(inode->i_mapping);
++
++	inode->i_mapping->a_ops = &hidemem_aops;
++
++	/* pretend we are a normal file with zero size */
++	inode->i_mode |= S_IFREG;
++	inode->i_size = 0;
++
++
++	return file;
++
++err_free_inode:
++	iput(inode);
++	return file;
++}
++
++SYSCALL_DEFINE1(memfd_hide, unsigned long, flags)
++{
++	struct file *file;
++	int fd, err;
++
++	/* make sure local flags do not confict with global fcntl.h */
++	BUILD_BUG_ON(HIDEMEM_FLAGS_MASK & O_CLOEXEC);
++
++	if (flags & ~(HIDEMEM_FLAGS_MASK | O_CLOEXEC))
++		return -EINVAL;
++
++	fd = get_unused_fd_flags(flags & O_CLOEXEC);
++	if (fd < 0)
++		return fd;
++
++	file = hidemem_file_create(flags);
++	if (IS_ERR(file)) {
++		err = PTR_ERR(file);
++		goto err_put_fd;
++	}
++
++	file->f_flags |= O_LARGEFILE;
++
++	fd_install(fd, file);
++	return fd;
++
++err_put_fd:
++	put_unused_fd(fd);
++	return err;
++}
++
++
++
++static const struct super_operations hidemem_super_ops = {
++
++};
++
++static int hidemem_init_fs_context(struct fs_context *fc)
++{
++	struct pseudo_fs_context *ctx = init_pseudo(fc, HIDEMEM_MAGIC);
++
++	if (!ctx)
++		return -ENOMEM;
++	ctx->ops = &hidemem_super_ops;
++
++	return 0;
++}
++
++static struct file_system_type hidemem_fs = {
++	.name		= "hidemem",
++	.init_fs_context = hidemem_init_fs_context,
++	.kill_sb	= kill_anon_super,
++};
++
++static int hidemem_init(void)
++{
++	int ret = 0;
++
++	hidemem_mnt = kern_mount(&hidemem_fs);
++	if (IS_ERR(hidemem_mnt))
++		ret = PTR_ERR(hidemem_mnt);
++
++	return ret;
++}
++fs_initcall(hidemem_init);
++
+-- 
+2.26.2
+
